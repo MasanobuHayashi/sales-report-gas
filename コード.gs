@@ -1,6 +1,10 @@
 /**
- * スプレッドシートを開いたときにカスタムメニューを追加します。
+ * 週報自動作成システム (Rev: Limit-Release)
+ * 修正内容: 
+ * 1. MAX_PROMPT_SIZE_BYTES を 9MB に緩和
+ * 2. テキスト圧縮ロジック（改行圧縮）の追加
  */
+
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('週報自動作成')
@@ -17,8 +21,9 @@ const START_DATE_CELL = "B3";
 const END_DATE_CELL = "B4";
 const MASTER_SHEET_NAME = "FOCusユーザマスタ";
 const DATA_SHEET_NAME = "週報データ抽出";
-const AI_MODEL = "models/gemini-2.5-pro"; // ★ Gemini 2.5 Pro 指定
-const MAX_PROMPT_SIZE_BYTES = 2 * 1024 * 1024; // 2MB
+const AI_MODEL = "models/gemini-2.5-pro"; // ★ ユーザー指定モデル
+// ★修正: 2MB制限を撤廃し、GASのPayload上限(約10MB)近くまで緩和
+const MAX_PROMPT_SIZE_BYTES = 9 * 1024 * 1024; // 9MB
 // ---------------------------------------------------------------------------------
 
 /**
@@ -121,9 +126,10 @@ ${inputDataText}
     // 6-1. オーバーフロー検知 (サイズチェック)
     logMessage += "6-1. オーバーフロー検知 (サイズチェック)... \n";
     const promptSize = Utilities.newBlob(finalPrompt).getBytes().length;
-    logMessage += `  -> プロンプトサイズ:  ${promptSize}  バイト \n`;
+    logMessage += `  -> プロンプトサイズ:  ${promptSize}  バイト (上限: ${MAX_PROMPT_SIZE_BYTES})\n`;
+    
     if (promptSize > MAX_PROMPT_SIZE_BYTES) {
-      throw new Error(`ERR-002: データ入力エラー。 プロンプトサイズ超過 ( ${promptSize}  バイト)。`);
+      throw new Error(`ERR-002: データ入力エラー。 プロンプトサイズ超過 ( ${promptSize}  バイト)。これ以上のデータ量は分割処理が必要です。`);
     }
 
     // 7. UrlFetchApp 呼び出し (Gemini API)
@@ -138,8 +144,6 @@ ${inputDataText}
 
       const API_URL = `https://generativelanguage.googleapis.com/v1beta/${AI_MODEL}:generateContent?key=${API_KEY}`;
 
-      // logMessage += `  -> API Endpoint: ${API_URL.split('?')[0]}\n`;
-
       const payload = {
         "contents": [{
           "parts": [{
@@ -153,7 +157,7 @@ ${inputDataText}
         'contentType': 'application/json',
         'payload': JSON.stringify(payload),
         'muteHttpExceptions': true,
-        'deadline': 300 // 5分 (300秒)
+        // timeoutはGASの仕様上、UrlFetchApp.fetchの実行時間上限に従います
       };
 
       const httpResponse = UrlFetchApp.fetch(API_URL, options);
@@ -177,7 +181,7 @@ ${inputDataText}
       }
 
     } catch (e) {
-      if (e.message.includes("Timeout") || e.message.includes("deadline")) {
+      if (e.message.includes("Timeout") || e.message.includes("deadline") || e.message.includes("Exceeded maximum execution")) {
         throw new Error(`ERR-101: Gemini AI サービスタイムアウト。 処理が5分以内に完了しませんでした。  ${e.message}`);
       }
       throw new Error(`ERR-100: Gemini AI サービスエラー (UrlFetchApp)。  ${e.message}`);
@@ -245,9 +249,6 @@ ${inputDataText}
 
 // --- ヘルパー関数 ---
 
-/**
- * ログをGoogle Driveに書き込みます。
- */
 function _writeLog(message, folderId) {
   try {
     const folder = DriveApp.getFolderById(folderId);
@@ -261,10 +262,16 @@ function _writeLog(message, folderId) {
 }
 
 /**
- * 1つのセルをCSV形式で安全にエスケープします。
+ * 1つのセルをCSV形式で安全にエスケープし、無駄な空白を圧縮します。
+ * ★ 修正: 文字列のカット（Truncate）は行いません。
  */
 function _escapeCsvCell(cell) {
   let strCell = (cell === null || cell === undefined) ? "" : String(cell);
+  
+  // ★追加: 改行コードの正規化と、過剰な改行（3つ以上）の圧縮
+  strCell = strCell.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  strCell = strCell.replace(/\n{3,}/g, "\n\n"); // 3つ以上の改行は2つにする
+
   if (strCell.includes('"')) {
     strCell = strCell.replace(/"/g, '""');
   }
@@ -274,19 +281,12 @@ function _escapeCsvCell(cell) {
   return strCell;
 }
 
-/**
- * 2次元配列をCSV文字列に変換します（_escapeCsvCell を使用）。
- */
 function _arrayToCsv(data) {
   return data.map(row =>
     row.map(cell => _escapeCsvCell(cell)).join(',')
   ).join('\n');
 }
 
-/**
- * ★ 修正版: 部署名を含めるように変更
- * 処理済みデータ（2次元配列）を、AIが読みやすい「担当者ごと」のテキスト形式に変換します。
- */
 function _createGroupedInputText(processedData) {
   const groupedData = new Map();
   const header = processedData[0];
@@ -294,21 +294,17 @@ function _createGroupedInputText(processedData) {
   const headerMap = new Map();
   header.forEach((h, idx) => headerMap.set(h, idx));
 
-  const idxStaffName = 1; // B列: 担当者 (固定)
+  const idxStaffName = 1; 
   const idxActivityDate = headerMap.get("活動日");
   const idxCustomerName = headerMap.get("顧客名");
   const idxPurpose = headerMap.get("活動目的");
   const idxResult = headerMap.get("予定及び活動結果");
   const idxDoko = headerMap.get("社外同行者");
-  // ★ 追加: 部署名のインデックスを取得
   const idxDepartment = headerMap.get("部署名");
 
-  // ★ 追加: 部署名を含める
   const headersForAi = ["部署名", "活動日", "顧客名", "活動目的", "予定及び活動結果", "社外同行者"];
-  // ★ 追加: 抽出対象に idxDepartment を追加
   const indicesToExtract = [idxDepartment, idxActivityDate, idxCustomerName, idxPurpose, idxResult, idxDoko];
 
-  // データ行をグループ化 (i=1から開始してヘッダーを除外)
   for (let i = 1; i < processedData.length; i++) {
     const row = processedData[i];
     const staffName = row[idxStaffName];
@@ -318,7 +314,6 @@ function _createGroupedInputText(processedData) {
     groupedData.get(staffName).push(row);
   }
 
-  // テキストを構築
   let inputDataText = "";
   for (const [staffName, rows] of groupedData.entries()) {
     inputDataText += `[担当者:  ${staffName}]\n`;
@@ -329,6 +324,7 @@ function _createGroupedInputText(processedData) {
         return (idx !== undefined) ? row[idx] : "";
       });
 
+      // _escapeCsvCell 側で文字数カットせず改行圧縮のみ実施
       const csvRow = extractedRow.map(cell => _escapeCsvCell(cell)).join(',');
       inputDataText += csvRow + "\n";
     }
@@ -338,24 +334,15 @@ function _createGroupedInputText(processedData) {
   return inputDataText;
 }
 
-
-/**
- * AIが生成したマークダウンテキストを解析し、Google Docのスタイルを適用します。
- */
 function _applyMarkdownStyles(body, rawAiText) {
-
   if (!rawAiText) {
     return;
   }
-
   const cleanedText = rawAiText.replace(/^\uFEFF/, "").trim();
   const lines = cleanedText.split('\n');
-
   lines.forEach(line => {
-
     try {
       const trimmedLine = line.trim();
-
       if (trimmedLine.startsWith("---") && trimmedLine.length < 5) {
         body.appendHorizontalRule();
         return;
@@ -364,16 +351,12 @@ function _applyMarkdownStyles(body, rawAiText) {
         body.appendParagraph("");
         return;
       }
-
-      let rawLineContent = line;
       let plainText = trimmedLine;
-
       let headingType = null;
-      let isBold = false; // 見出しのみ太字
+      let isBold = false;
       let isListItem = false;
       let indentLevel = 0;
 
-      // スタイルの判定 (見出し)
       if (plainText.startsWith("# ")) {
         headingType = DocumentApp.ParagraphHeading.TITLE;
         plainText = plainText.substring(2);
@@ -387,24 +370,17 @@ function _applyMarkdownStyles(body, rawAiText) {
         plainText = plainText.substring(4);
         isBold = true;
       } else if (plainText.startsWith("#### ")) {
-        // 見出し4はアンカーリンク防止のため、通常の太字段落として扱う
         headingType = null;
         plainText = plainText.substring(5);
         isBold = true;
-      }
-      // リスト (-) の判定
-      else if (rawLineContent.match(/^(\s*)- /) || rawLineContent.match(/^(\s*)\* /)) {
+      } else if (line.match(/^(\s*)- /) || line.match(/^(\s*)\* /)) {
         isListItem = true;
-
-        const indentMatch = rawLineContent.match(/^\s*/);
+        const indentMatch = line.match(/^\s*/);
         indentLevel = indentMatch ? Math.floor(indentMatch[0].length / 2) : 0;
-
-        plainText = rawLineContent.replace(/^\s*[-*] /, "").trim();
+        plainText = line.replace(/^\s*[-*] /, "").trim();
       }
 
-      // ドキュメントに書き込む
       let paragraph;
-
       if (isListItem) {
         const listItem = body.appendListItem(plainText);
         listItem.setGlyphType(DocumentApp.GlyphType.BULLET);
@@ -419,8 +395,6 @@ function _applyMarkdownStyles(body, rawAiText) {
           paragraph.setHeading(headingType);
         }
       }
-
-      // 行全体の太字を適用 (見出しの場合のみ)
       if (isBold && plainText.length > 0 && paragraph) {
         const textElement = paragraph.editAsText();
         const textLength = textElement.getText().length;
@@ -428,9 +402,8 @@ function _applyMarkdownStyles(body, rawAiText) {
           textElement.setBold(0, textLength - 1, true);
         }
       }
-
     } catch (e) {
-      Logger.log(`スタイル適用エラー:  ${e.message} (Line: ${line}) Stack: ${e.stack}`);
+      Logger.log(`スタイル適用エラー:  ${e.message}`);
     }
   });
 }
