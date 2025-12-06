@@ -218,23 +218,96 @@ function _createGroupedInputText(data) {
   }
   return txt;
 }
-function _applyMarkdownStyles(body, txt) {
-  if (!txt) return;
-  const lines = txt.replace(/^\uFEFF/, "").split('\n');
-  lines.forEach(l => {
+/**
+ * AIが生成したマークダウンテキストを解析し、Google Docのスタイルを適用します。
+ * 修正: "####" (担当者名) を「太字の本文」ではなく「見出し3」として扱い、以前の書式に戻しました。
+ */
+function _applyMarkdownStyles(body, rawAiText) {
+
+  if (!rawAiText) {
+    return;
+  }
+
+  const cleanedText = rawAiText.replace(/^\uFEFF/, "").trim();
+  const lines = cleanedText.split('\n');
+
+  lines.forEach(line => {
+
     try {
-      const t = l.trim();
-      if (t.startsWith("---")) { body.appendHorizontalRule(); return; }
-      if (t === "") { body.appendParagraph(""); return; }
-      let p;
-      if (l.match(/^(\s*)[-*] /)) {
-        p = body.appendListItem(t.replace(/^[-*] /, "").trim()).setGlyphType(DocumentApp.GlyphType.BULLET);
-      } else {
-        p = body.appendParagraph(t);
-        if (t.startsWith("# ")) p.setHeading(DocumentApp.ParagraphHeading.TITLE);
-        else if (t.startsWith("## ")) p.setHeading(DocumentApp.ParagraphHeading.HEADING1);
-        else if (t.startsWith("### ")) p.setHeading(DocumentApp.ParagraphHeading.HEADING2);
+      const trimmedLine = line.trim();
+
+      if (trimmedLine.startsWith("---") && trimmedLine.length < 5) {
+        body.appendHorizontalRule();
+        return;
       }
-    } catch(e){}
+      if (trimmedLine === "") {
+        body.appendParagraph("");
+        return;
+      }
+
+      let plainText = trimmedLine;
+      let headingType = null;
+      let isBold = false; // 見出しのみ太字
+      let isListItem = false;
+      let indentLevel = 0;
+
+      // スタイルの判定 (見出し)
+      // Googleドキュメントの階層構造に合わせてマッピングします
+      if (plainText.startsWith("# ")) {
+        headingType = DocumentApp.ParagraphHeading.TITLE; // タイトル
+        plainText = plainText.substring(2);
+        isBold = true;
+      } else if (plainText.startsWith("## ")) {
+        headingType = DocumentApp.ParagraphHeading.HEADING1; // 見出し1 (セクション)
+        plainText = plainText.substring(3);
+        isBold = true;
+      } else if (plainText.startsWith("### ")) {
+        headingType = DocumentApp.ParagraphHeading.HEADING2; // 見出し2 (部署名)
+        plainText = plainText.substring(4);
+        isBold = true;
+      } else if (plainText.startsWith("#### ")) {
+        // ★修正箇所: ここを「見出し3」に戻します
+        headingType = DocumentApp.ParagraphHeading.HEADING3; // 見出し3 (担当者名)
+        plainText = plainText.substring(5);
+        isBold = true;
+      }
+      // リスト (-) の判定
+      else if (rawLineContent = line.match(/^(\s*)- /) || line.match(/^(\s*)\* /)) {
+        isListItem = true;
+        const indentMatch = line.match(/^\s*/);
+        indentLevel = indentMatch ? Math.floor(indentMatch[0].length / 2) : 0;
+        plainText = line.replace(/^\s*[-*] /, "").trim();
+      }
+
+      // ドキュメントに書き込む
+      let paragraph;
+
+      if (isListItem) {
+        const listItem = body.appendListItem(plainText);
+        listItem.setGlyphType(DocumentApp.GlyphType.BULLET);
+        if (indentLevel > 0) {
+          listItem.setIndentFirstLine(18 * indentLevel);
+          listItem.setIndentStart(36 * indentLevel);
+        }
+        paragraph = listItem;
+      } else {
+        paragraph = body.appendParagraph(plainText);
+        if (headingType) {
+          paragraph.setHeading(headingType);
+        }
+      }
+
+      // 行全体の太字を適用 (見出しの場合のみ)
+      if (isBold && plainText.length > 0 && paragraph) {
+        const textElement = paragraph.editAsText();
+        const textLength = textElement.getText().length;
+        if (textLength > 0) {
+          textElement.setBold(0, textLength - 1, true);
+        }
+      }
+
+    } catch (e) {
+      Logger.log(`スタイル適用エラー: ${e.message}`);
+    }
   });
 }
