@@ -1,9 +1,9 @@
 /**
- * 週報自動作成システム (Rev: Format-and-Style-Optimization)
+ * 週報自動作成システム (Rev: Signature-and-Format-Strict-Update)
  * 修正内容: 
- * 1. GAS側のタイトル挿入を廃止し、プロンプト指示通りのタイトル出力をAIに一任
- * 2. 分析ステップに日付情報を渡し、タイトルプレースホルダを正確に埋めるよう改善
- * 3. 文中太字(**...**)のパース処理を強化し、書式不整合を解消
+ * 1. Utilities.formatDate の引数エラーを解消（Dateオブジェクトへの明示的変換）
+ * 2. タイトル二重出力の解消（AIにタイトルの執筆と日付置換を完全に委ねる）
+ * 3. 文中太字のパース精度向上とハードコーディングの徹底排除
  */
 
 function onOpen() {
@@ -13,6 +13,7 @@ function onOpen() {
     .addToUi();
 }
 
+// --- 定数定義 ---
 const SETTINGS_SHEET_NAME = "設定シート";
 const PROMPT_DOC_ID_CELL = "B7";
 const OUTPUT_FOLDER_ID_CELL = "B8";
@@ -23,6 +24,9 @@ const MASTER_SHEET_NAME = "FOCusユーザマスタ";
 const DATA_SHEET_NAME = "週報データ抽出";
 const AI_MODEL = "models/gemini-2.5-flash"; 
 
+/**
+ * 週報自動作成のメイン処理
+ */
 function startReportGeneration() {
   const ui = SpreadsheetApp.getUi();
   let logMessage = "処理開始 (ボタン押下) \n";
@@ -34,9 +38,16 @@ function startReportGeneration() {
     const settingsSheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
     if (!settingsSheet) throw new Error(`ERR-999: 設定シートが見つかりません。`);
 
-    const startDate = settingsSheet.getRange(START_DATE_CELL).getValue();
-    const endDate = settingsSheet.getRange(END_DATE_CELL).getValue();
-    const dateRangeStr = `${Utilities.formatDate(startDate, "JST", "yyyy年MM月dd日")}～${Utilities.formatDate(endDate, "JST", "yyyy年MM月dd日")}`;
+    // 日付取得の安全性を確保
+    const rawStart = settingsSheet.getRange(START_DATE_CELL).getValue();
+    const rawEnd = settingsSheet.getRange(END_DATE_CELL).getValue();
+    if (!rawStart || !rawEnd) throw new Error("ERR-001: 設定シートの日付が空です。");
+    
+    // 明示的にDateオブジェクトに変換（シグネチャエラー対策）
+    const startDate = new Date(rawStart);
+    const endDate = new Date(rawEnd);
+    const tz = Session.getScriptTimeZone();
+    const dateRangeStr = `${Utilities.formatDate(startDate, tz, "yyyy年MM月dd日")}～${Utilities.formatDate(endDate, tz, "yyyy年MM月dd日")}`;
 
     const settings = {
       promptDocId: settingsSheet.getRange(PROMPT_DOC_ID_CELL).getValue(),
@@ -45,11 +56,11 @@ function startReportGeneration() {
     };
     logFolderId = settings.logFolderId;
 
+    // 1. マスタ順序の読み込み
     const masterSheet = ss.getSheetByName(MASTER_SHEET_NAME);
     const masterData = masterSheet.getDataRange().getValues();
     const masterOrder = []; 
     const orderedDepts = []; 
-    
     for (let i = 1; i < masterData.length; i++) {
       const name = masterData[i][1];
       const dept = masterData[i][2];
@@ -59,6 +70,7 @@ function startReportGeneration() {
       }
     }
 
+    // 2. データ取得
     const dataSheet = ss.getSheetByName(DATA_SHEET_NAME);
     const rawReportData = dataSheet.getDataRange().getValues();
     if (rawReportData.length <= 1) throw new Error("ERR-001: 週報データがありません。");
@@ -101,28 +113,28 @@ function startReportGeneration() {
 【部署別セクション生成指示】
 1. 現在は「${deptName}」の詳細報告セクションを執筆しています。
 2. 指示書の構成案に基づき、担当者別の活動詳細をマークダウンで出力してください。
-3. 文末に必ず【DEPT_ANALYSIS】というタグを入れ、続けてこの部署の要約を記述してください。
+3. 文末に必ず【DEPT_SUMMARY】というタグを入れ、続けてこの部署の分析用要約を記述してください。
 4. メタ発言は厳禁です。
 
 入力データ:
 ${deptDataForAi}
 `;
         const res = _callGeminiApi(detailPrompt, currentApiKey);
-        const parts = res.split("【DEPT_ANALYSIS】");
+        const parts = res.split("【DEPT_SUMMARY】");
         detailContent += parts[0].trim() + "\n\n";
         analysisSummaries += `■部署: ${deptName}\n${parts[1] || ""}\n\n`;
       }
     }
 
-    // --- STEP 2: 全体統合および分析 ---
-    logMessage += "7-2. 全体要約・構成生成（日付連携）...\n";
+    // --- STEP 2: 全体統合および構成生成 ---
+    logMessage += "7-2. 全体構成生成（タイトル日付置換）...\n";
     const analysisPrompt = `${promptTemplate}
 ---
 【全体分析・構成生成指示】
-1. プロンプトの構成定義に基づき、「タイトル」「全体サマリー」「組織全体の課題」セクションのみを執筆してください。
-2. タイトルに含まれる「yyyy年mm月dd日～yyyy年mm月dd日」は「${dateRangeStr}」に必ず置換してください。
-3. 詳細セクションを挿入すべき場所に「{{DETAIL_PLACEHOLDER}}」と記述してください。
-4. ナンバリングや書式（太字等）を指示書通りに維持してください。
+1. プロンプトの構成定義に基づき、「タイトル」「全体サマリー」「組織全体の課題」セクションを執筆してください。
+2. タイトル内の日付プレースホルダ（yyyy年...）は必ず「${dateRangeStr}」に書き換えてください。
+3. 詳細セクション（部署別報告）を挿入すべき場所に、単独行で「{{DETAIL_PLACEHOLDER}}」と記述してください。
+4. メタ発言を排除し、マークダウン書式（#～####, **太字**）を厳格に適用してください。
 
 分析用インプット:
 ${analysisSummaries}
@@ -131,15 +143,16 @@ ${analysisSummaries}
     const finalFullText = finalShell.replace("{{DETAIL_PLACEHOLDER}}", detailContent);
 
     // 8. ドキュメント出力
-    logMessage += "8. ドキュメント出力...\n";
+    logMessage += "8. ドキュメント出力統合...\n";
     const outputFolder = DriveApp.getFolderById(settings.outputFolderId);
-    const fileName = "週報_" + Utilities.formatDate(startDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
+    const fileName = "週報_" + Utilities.formatDate(startDate, tz, "yyyy-MM-dd");
     const existing = outputFolder.getFilesByName(fileName);
     while (existing.hasNext()) existing.next().setTrashed(true);
 
     const doc = DocumentApp.create(fileName);
     const body = doc.getBody();
-    // GASによるタイトル自動挿入を廃止し、AIの出力に委ねる
+    
+    // AIが生成したテキストをスタイリングしながら流し込む（ハードコードされたタイトルは無し）
     _applyMarkdownStyles(body, finalFullText);
 
     doc.saveAndClose();
@@ -152,12 +165,13 @@ ${analysisSummaries}
   } catch (e) {
     let safeErr = currentApiKey ? e.message.split(currentApiKey).join("********") : e.message;
     logMessage += `Z. エラー: ${safeErr}\n`;
-    ui.alert(`エラー: ${safeErr}`);
+    ui.alert(`エラーが発生しました。\n${safeErr}`);
   } finally {
     if (logFolderId) _writeLog(logMessage, logFolderId);
   }
 }
 
+/** Gemini API呼び出し */
 function _callGeminiApi(prompt, apiKey) {
   const url = `https://generativelanguage.googleapis.com/v1beta/${AI_MODEL}:generateContent?key=${apiKey}`;
   const options = {
@@ -180,7 +194,8 @@ function _createStaffText(staff, dept, rows) {
   const targets = ["部署名", "活動日", "顧客名", "活動目的", "予定及び活動結果", "社外同行者"];
   let txt = `[担当者: ${staff} (部署: ${dept})]\n${targets.join(",")}\n`;
   rows.forEach(r => {
-    const vals = [dept, r[0] instanceof Date ? Utilities.formatDate(r[0], "JST", "MM/dd") : r[0], r[2], r[3], r[4], r[5]];
+    const dStr = r[0] instanceof Date ? Utilities.formatDate(r[0], "JST", "MM/dd") : String(r[0]);
+    const vals = [dept, dStr, r[2], r[3], r[4], r[5]];
     txt += vals.map(v => _escCsv(v)).join(',') + "\n";
   });
   return txt;
@@ -191,15 +206,19 @@ function _escCsv(c) {
   return (s.includes('"') || s.includes(',')) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
+/** マークダウンパース */
 function _applyMarkdownStyles(body, rawAiText) {
   if (!rawAiText) return;
   const lines = rawAiText.replace(/^\uFEFF/, "").split('\n');
   lines.forEach(line => {
     try {
       const trim = line.trim();
-      if (trim.startsWith("---")) { body.appendHorizontalRule(); return; }
-      if (trim === "") { body.appendParagraph(""); return; }
-
+      if (trim.startsWith("---") || trim === "") {
+        if (trim.startsWith("---")) body.appendHorizontalRule();
+        else body.appendParagraph("");
+        return;
+      }
+      
       let plain = trim;
       let head = null;
       if (plain.startsWith("# ")) { head = DocumentApp.ParagraphHeading.TITLE; plain = plain.substring(2); }
@@ -216,37 +235,29 @@ function _applyMarkdownStyles(body, rawAiText) {
       }
       
       // 文中の **太字** を処理
-      _processBoldText(p);
-
+      _renderBold(p);
     } catch (e) {}
   });
 }
 
-/**
- * 段落内の **太字** を処理し、記号を除去して書式を適用します
- */
-function _processBoldText(paragraph) {
+function _renderBold(paragraph) {
   const text = paragraph.editAsText();
   let content = text.getText();
-  const boldRegex = /\*\*(.*?)\*\*/g;
+  const regex = /\*\*(.*?)\*\*/g;
   let match;
   let offset = 0;
 
-  while ((match = boldRegex.exec(content)) !== null) {
-    const fullMatch = match[0];
-    const innerText = match[1];
-    const startIdx = match.index - offset;
+  while ((match = regex.exec(content)) !== null) {
+    const full = match[0];
+    const inner = match[1];
+    const start = match.index - offset;
     
-    // ** を削除して中身のみを置換
-    text.deleteText(startIdx, startIdx + fullMatch.length - 1);
-    text.insertText(startIdx, innerText);
+    text.deleteText(start, start + full.length - 1);
+    text.insertText(start, inner);
+    text.setBold(start, start + inner.length - 1, true);
     
-    // 太字を適用
-    text.setBold(startIdx, startIdx + innerText.length - 1, true);
-    
-    // 文字数が減った分(記号4文字分)を相殺
-    offset += (fullMatch.length - innerText.length);
+    offset += (full.length - inner.length);
     content = text.getText();
-    boldRegex.lastIndex = startIdx + innerText.length;
+    regex.lastIndex = start + inner.length;
   }
 }
