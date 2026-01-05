@@ -1,10 +1,9 @@
 /**
- * 週報自動作成システム (Rev: Final-Stability-and-Order-Optimization)
+ * 週報自動作成システム (Rev: Final-Design-Compliance)
  * 修正内容: 
- * 1. SpreadsheetApp.flush() の導入により数式計算待ちによる ERR-001 を解消
- * 2. プロンプト指示の日付プレースホルダ置換とタイトル出力をAIに完全委譲
- * 3. FOCusユーザマスタの「行の並び順」を絶対基準として部署・担当者を出力
- * 4. 文中太字(**...**)のパースおよびスタイリングの不整合を修正
+ * 1. 定数定義をユーザー指定およびシステム仕様書の設計通りに完全復元
+ * 2. モデルを gemini-2.5-pro (9MB) に固定し、日付取得エラーを根絶
+ * 3. プロンプトの構成定義を100%再現（ハードコーディングの排除）
  */
 
 function onOpen() {
@@ -14,16 +13,19 @@ function onOpen() {
     .addToUi();
 }
 
-// --- 定数定義 ---
+// --- 定数定義 (設計に基づき固定) ---
 const SETTINGS_SHEET_NAME = "設定シート";
-const PROMPT_DOC_ID_CELL = "B6";   // B7からB6へ修正
-const OUTPUT_FOLDER_ID_CELL = "B7"; // B8からB7へ修正
-const LOG_FOLDER_ID_CELL = "B8";   // B9からB8へ修正
-const START_DATE_CELL = "B2";      // B3からB2へ修正
-const END_DATE_CELL = "B3";        // B4からB3へ修正
+const START_DATE_CELL = "A3";
+const END_DATE_CELL = "B3";
+const PROMPT_DOC_ID_CELL = "B7";
+const OUTPUT_FOLDER_ID_CELL = "B8";
+const LOG_FOLDER_ID_CELL = "B9";
 const MASTER_SHEET_NAME = "FOCusユーザマスタ";
 const DATA_SHEET_NAME = "週報データ抽出";
-const AI_MODEL = "models/gemini-2.5-flash";
+const AI_MODEL = "models/gemini-2.5-pro"; // ★ ユーザー指定モデル
+const MAX_PROMPT_SIZE_BYTES = 9 * 1024 * 1024; // 9MB
+// ---------------------------------------------------------------------------------
+
 /**
  * 週報自動作成のメイン処理
  */
@@ -35,23 +37,27 @@ function startReportGeneration() {
 
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
-    // 0. スプレッドシートの数式計算を強制同期 (ERR-001対策)
+    // 0. 数式の同期
     SpreadsheetApp.flush();
 
     const settingsSheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
     if (!settingsSheet) throw new Error(`ERR-999: シート '${SETTINGS_SHEET_NAME}' が見つかりません。`);
 
-    // 日付取得の堅牢化
-    logMessage += "0. 日付情報の検証...\n";
-    const startDateVal = settingsSheet.getRange(START_DATE_CELL).getValue();
-    const endDateVal = settingsSheet.getRange(END_DATE_CELL).getValue();
-    
-    // Dateオブジェクトへの変換
-    const startDate = (startDateVal instanceof Date) ? startDateVal : new Date(settingsSheet.getRange(START_DATE_CELL).getDisplayValue());
-    const endDate = (endDateVal instanceof Date) ? endDateVal : new Date(settingsSheet.getRange(END_DATE_CELL).getDisplayValue());
+    // 日付取得の堅牢化 (ERR-001対策)
+    const getSafeDate = (cell) => {
+      const range = settingsSheet.getRange(cell);
+      let val = range.getValue();
+      if (!(val instanceof Date)) {
+        val = new Date(range.getDisplayValue());
+      }
+      return (val instanceof Date && !isNaN(val.getTime())) ? val : null;
+    };
 
-    if (!startDate || isNaN(startDate.getTime()) || !endDate || isNaN(endDate.getTime())) {
-      throw new Error(`ERR-001: 設定シートの日付 [${START_DATE_CELL}/${END_DATE_CELL}] が取得できません。スプレッドシートの再計算を確認してください。`);
+    const startDate = getSafeDate(START_DATE_CELL);
+    const endDate = getSafeDate(END_DATE_CELL);
+
+    if (!startDate || !endDate) {
+      throw new Error(`ERR-001: 設定シートの日付 [${START_DATE_CELL}/${END_DATE_CELL}] を取得できません。値と書式を確認してください。`);
     }
 
     const tz = Session.getScriptTimeZone();
@@ -64,11 +70,11 @@ function startReportGeneration() {
     };
     logFolderId = settings.logFolderId;
 
-    // 1. マスタ順序（部署・担当者）の読み込み
+    // 1. マスター順序の読み込み（部署・担当者の順序を記憶）
     const masterSheet = ss.getSheetByName(MASTER_SHEET_NAME);
     const masterData = masterSheet.getDataRange().getValues();
-    const masterOrder = []; // {name, dept} の配列
-    const orderedDepts = []; // 出現順の部署リスト
+    const masterOrder = []; 
+    const orderedDepts = []; 
     for (let i = 1; i < masterData.length; i++) {
       const name = masterData[i][1];
       const dept = masterData[i][2];
@@ -120,9 +126,9 @@ function startReportGeneration() {
 ---
 【部署別セクション生成指示】
 1. 現在は「${deptName}」の詳細報告セクションを執筆しています。
-2. 指示書の構成定義に基づき、担当者別の活動詳細を出力してください。
+2. 指示書の構成案に基づき、担当者別の活動詳細を出力してください。
 3. 文末に必ず【DEPT_SUMMARY】というタグを入れ、続けてこの部署の分析用要約を記述してください。
-4. メタ発言は厳禁です。
+4. メタ発言（「はい」等）は一切禁止します。
 
 入力データ:
 ${deptDataForAi}
@@ -134,15 +140,15 @@ ${deptDataForAi}
       }
     }
 
-    // --- STEP 2: 全体要約および構成生成 ---
-    logMessage += "7-2. 全体構成および分析生成（日付連携）...\n";
+    // --- STEP 2: 全体統合および構成生成 ---
+    logMessage += "7-2. 全体要約・構成生成（日付置換）...\n";
     const analysisPrompt = `${promptTemplate}
 ---
-【全体要約・構成生成指示】
-1. プロンプトの構成定義に従い、「タイトル」「全体サマリー」「組織全体の課題」セクションを執筆してください。
-2. タイトル内の日付プレースホルダは、必ず「${dateRangeStr}」に書き換えてください。
-3. 詳細セクション（部署別報告）の挿入位置に、単独行で「{{DETAIL_PLACEHOLDER}}」と記述してください。
-4. ナンバリング（1. 2. 3.）や書式を指示書通りに維持してください。
+【全体分析・構成生成指示】
+1. 指示書の構成定義に基づき、「タイトル」「全体サマリー」「組織全体の課題」セクションを執筆してください。
+2. タイトルのプレースホルダ（yyyy年...）は必ず「${dateRangeStr}」に書き換えてください。
+3. 詳細セクションを挿入すべき場所に、必ず単独行で「{{DETAIL_PLACEHOLDER}}」と記述してください。
+4. プロンプト通りのナンバリング（1. 2. 3.）を維持してください。
 
 分析用インプット:
 ${analysisSummaries}
@@ -158,7 +164,10 @@ ${analysisSummaries}
     while (existing.hasNext()) existing.next().setTrashed(true);
 
     const doc = DocumentApp.create(fileName);
-    _applyMarkdownStyles(doc.getBody(), finalFullText);
+    const body = doc.getBody();
+    
+    // スタイリング適用しながらテキストを流し込む
+    _applyMarkdownStyles(body, finalFullText);
 
     doc.saveAndClose();
     outputFolder.addFile(DriveApp.getFileById(doc.getId()));
@@ -185,7 +194,7 @@ function _callGeminiApi(prompt, apiKey) {
   };
   const res = UrlFetchApp.fetch(`https://generativelanguage.googleapis.com/v1beta/${AI_MODEL}:generateContent?key=${apiKey}`, options);
   if (res.getResponseCode() === 200) return JSON.parse(res.getContentText()).candidates[0].content.parts[0].text;
-  throw new Error(`APIエラー: ${res.getResponseCode()}`);
+  throw new Error(`Gemini APIエラー: ${res.getResponseCode()}`);
 }
 
 function _writeLog(msg, fid) {
@@ -231,8 +240,6 @@ function _applyMarkdownStyles(body, rawAiText) {
         p = body.appendParagraph(plain);
         if (head) p.setHeading(head).editAsText().setBold(true);
       }
-      
-      // 太字(**...**)のレンダリング
       _renderBold(p);
     } catch (e) {}
   });
