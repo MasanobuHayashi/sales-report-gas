@@ -1,9 +1,8 @@
 /**
- * 週報自動作成システム (Rev: Map-Reduce-Update)
+ * 週報自動作成システム (Rev: Multi-Stage-Synthesis-Update)
  * 修正内容: 
- * 1. 部署ごとにAPIを呼び出す「分割処理」を実装し、出力制限によるデータ欠落を防止
- * 2. モデルを gemini-2.5-flash に変更し処理を高速化
- * 3. セキュリティ対策（APIキーのマスク処理）を継承
+ * 1. プロンプト指示通りの「全体サマリー」および「組織課題」を生成する2段階ステップを実装
+ * 2. 部署別詳細レポートからエグゼクティブ・サマリーを抽出するロジックを追加
  */
 
 function onOpen() {
@@ -22,7 +21,6 @@ const START_DATE_CELL = "B3";
 const END_DATE_CELL = "B4";
 const MASTER_SHEET_NAME = "FOCusユーザマスタ";
 const DATA_SHEET_NAME = "週報データ抽出";
-// モデルを Flash に変更
 const AI_MODEL = "models/gemini-2.5-flash"; 
 const MAX_PROMPT_SIZE_BYTES = 9 * 1024 * 1024; // 9MB
 // ---------------------------------------------------------------------------------
@@ -52,107 +50,110 @@ function startReportGeneration() {
     };
     logFolderId = settings.logFolderId;
 
-    // 1. 部署マスター取得
-    logMessage += "1. 知識データ取得...\n";
+    // 1. マスターおよびデータ取得
+    logMessage += "1. データ取得...\n";
     const masterSheet = ss.getSheetByName(MASTER_SHEET_NAME);
-    if (!masterSheet) throw new Error(`ERR-999: シート '${MASTER_SHEET_NAME}' が見つかりません。`);
+    const dataSheet = ss.getSheetByName(DATA_SHEET_NAME);
+    if (!masterSheet || !dataSheet) throw new Error("ERR-999: 必要なシートが見つかりません。");
+    
     const masterData = masterSheet.getDataRange().getValues();
+    const reportData = dataSheet.getDataRange().getValues();
+    if (reportData.length <= 1) throw new Error("ERR-001: 週報データがありません。");
+
     const departmentMap = new Map();
     for (let i = 1; i < masterData.length; i++) {
       if (masterData[i][1]) departmentMap.set(masterData[i][1], masterData[i][2]);
     }
 
-    // 3. データ取得
-    logMessage += "3. データ取得...\n";
-    const dataSheet = ss.getSheetByName(DATA_SHEET_NAME);
-    if (!dataSheet) throw new Error(`ERR-999: シート '${DATA_SHEET_NAME}' が見つかりません。`);
-    const reportData = dataSheet.getDataRange().getValues();
-    if (reportData.length <= 1) throw new Error("ERR-001: 週報データがありません。");
-
-    // 4. データ前処理：部署ごとにグループ化
-    logMessage += "4. 部署ごとのグループ化処理...\n";
+    // 4. 部署ごとのグループ化
     const header = reportData[0];
-    const deptGroups = new Map(); // Map<部署名, 行配列[]>
-
+    const deptGroups = new Map();
     for (let i = 1; i < reportData.length; i++) {
       const row = reportData[i];
-      const staffName = row[1];
-      const deptName = departmentMap.get(staffName) || "不明";
-      
+      const deptName = departmentMap.get(row[1]) || "不明";
       if (!deptGroups.has(deptName)) deptGroups.set(deptName, [header]);
       deptGroups.get(deptName).push([...row, deptName]);
     }
 
-    // 5. プロンプト雛形取得
+    // 5. プロンプト取得
     logMessage += "5. プロンプト雛形取得...\n";
     let promptTemplate;
     try {
       promptTemplate = DocumentApp.openById(settings.promptDocId).getBody().getText();
     } catch (e) {
-      throw new Error(`ERR-201: プロンプト雛形(ID: ${settings.promptDocId})が読み込めません。`);
+      throw new Error(`ERR-201: プロンプト雛形読込エラー。`);
     }
 
-    // APIキーの取得
     currentApiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-    if (!currentApiKey) throw new Error("スクリプトプロパティ 'GEMINI_API_KEY' が未設定です。");
+    if (!currentApiKey) throw new Error("APIキー未設定。");
 
-    // 7. 部署ごとにAPIを呼び出して内容を生成
-    logMessage += `7. 部署別分割処理開始 (合計 ${deptGroups.size} 部署)...\n`;
-    let totalAiContent = "";
+    // --- STEP 1: 部署別詳細レポートの生成 ---
+    logMessage += "7-1. 部署別詳細生成ステップ...\n";
+    let detailContent = "";
     const sortedDepts = Array.from(deptGroups.keys()).sort();
 
     for (const deptName of sortedDepts) {
-      logMessage += `  -> ${deptName} の週報を生成中...\n`;
+      logMessage += `  -> ${deptName} 生成中...\n`;
       const deptData = deptGroups.get(deptName);
       const inputDataText = _createGroupedInputText(deptData);
       
-      // 部署固有の指示を追加して、取りこぼしを防ぐ
-      const specificPrompt = `${promptTemplate}
-
+      const detailPrompt = `${promptTemplate}
 ---
-【重要指示】
-現在は「${deptName}」のセクションを作成しています。
-タイトルや全体サマリーは含めず、この部署の「### 部署名」から始まる詳細内容のみを、
-漏れなく出力してください。
+【部署別レポート指示】
+現在は「${deptName}」のセクションを執筆しています。
+全体サマリーや組織課題は書かず、この部署の「### 部署名」から始まる詳細（担当者別報告）のみを、1人も漏らさず出力してください。
 
 入力データ:
 ${inputDataText}
 `;
-
-      const response = _callGeminiApi(specificPrompt, currentApiKey);
-      totalAiContent += response + "\n\n---\n\n";
+      detailContent += _callGeminiApi(detailPrompt, currentApiKey) + "\n\n";
     }
 
-    // 8. ドキュメント出力
-    logMessage += "8. ドキュメント出力処理...\n";
+    // --- STEP 2: 全体サマリーおよび組織課題の生成 ---
+    logMessage += "7-2. 全体サマリー・組織課題生成ステップ...\n";
+    const analysisPrompt = `${promptTemplate}
+---
+【全体分析指示】
+上記の指示に基づき、全部署の詳細レポート（以下に添付）を分析し、
+プロンプト構成の「全体サマリー（冒頭）」および「組織全体の課題と次週の重点事項（文末）」のみを、
+シニアセールスマネージャーの視点で執筆してください。
+
+※部署別・担当者別の詳細は、以下の入力データに含まれているため、ここでは出力しないでください。
+
+入力データ（全部署のレポート詳細）:
+${detailContent}
+`;
+    const analysisResult = _callGeminiApi(analysisPrompt, currentApiKey);
+
+    // 8. ドキュメント出力と構成
+    logMessage += "8. ドキュメント出力と統合...\n";
     const outputFolder = DriveApp.getFolderById(settings.outputFolderId);
     const fileName = "週報_" + Utilities.formatDate(settings.startDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
-    
     const existing = outputFolder.getFilesByName(fileName);
     while (existing.hasNext()) existing.next().setTrashed(true);
 
     const doc = DocumentApp.create(fileName);
     const body = doc.getBody();
-    
-    // 冒頭にタイトルを挿入
     const titleDate = Utilities.formatDate(settings.startDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
+    
+    // 構成の統合： [タイトル] -> [全体サマリー] -> [部署別詳細] -> [組織課題]
     body.appendParagraph(`営業週報（${titleDate} 〜）`).setHeading(DocumentApp.ParagraphHeading.TITLE);
     
-    _applyMarkdownStyles(body, totalAiContent);
+    // 分析結果（冒頭サマリーと末尾課題を含む）をパースして適用
+    _applyMarkdownStyles(body, analysisResult + "\n\n" + detailContent);
+
     doc.saveAndClose();
-    
     const file = DriveApp.getFileById(doc.getId());
     outputFolder.addFile(file);
     DriveApp.getRootFolder().removeFile(file);
 
     logMessage += "P. 処理成功\n";
-    ui.alert("週報の自動作成が完了しました。全ての部署の内容が含まれています。");
+    ui.alert("週報の自動作成が完了しました。サマリーと組織課題を含む全ての指示内容が反映されました。");
 
   } catch (e) {
     let safeErrorMessage = currentApiKey ? e.message.split(currentApiKey).join("********") : e.message;
     logMessage += `Z. エラー発生: ${safeErrorMessage}\n`;
-    const alertText = `処理を中断しました。\n\n【エラー内容】\n${safeErrorMessage}`;
-    ui.alert(alertText);
+    ui.alert(`処理を中断しました。\n\n【エラー内容】\n${safeErrorMessage}`);
   } finally {
     if (logFolderId) _writeLog(logMessage, logFolderId);
     else Logger.log(logMessage);
@@ -203,14 +204,12 @@ function _createGroupedInputText(data) {
   h.forEach((v, i) => hMap.set(v, i));
   const targets = ["部署名", "活動日", "顧客名", "活動目的", "予定及び活動結果", "社外同行者"];
   const idxs = targets.map(t => hMap.get(t));
-  
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
-    const s = r[1]; // 担当者
+    const s = r[1];
     if (!map.has(s)) map.set(s, []);
     map.get(s).push(r);
   }
-  
   let txt = "";
   for (const [s, rows] of map.entries()) {
     txt += `[担当者: ${s}]\n` + targets.join(",") + "\n";
@@ -259,7 +258,6 @@ function _applyMarkdownStyles(body, rawAiText) {
       const paragraph = body.appendParagraph(plainText);
       if (headingType) paragraph.setHeading(headingType);
       if (isBold && plainText.length > 0) paragraph.editAsText().setBold(true);
-
     } catch (e) {
       Logger.log(`スタイル適用エラー: ${e.message}`);
     }
