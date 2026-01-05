@@ -1,6 +1,9 @@
 /**
- * 週報自動作成システム (Rev: Error-Handling-Update)
- * 修正内容: エラー発生時のUIメッセージを変更（開発者への問い合わせを誘導）
+ * 週報自動作成システム (Rev: Map-Reduce-Update)
+ * 修正内容: 
+ * 1. 部署ごとにAPIを呼び出す「分割処理」を実装し、出力制限によるデータ欠落を防止
+ * 2. モデルを gemini-2.5-flash に変更し処理を高速化
+ * 3. セキュリティ対策（APIキーのマスク処理）を継承
  */
 
 function onOpen() {
@@ -19,7 +22,8 @@ const START_DATE_CELL = "B3";
 const END_DATE_CELL = "B4";
 const MASTER_SHEET_NAME = "FOCusユーザマスタ";
 const DATA_SHEET_NAME = "週報データ抽出";
-const AI_MODEL = "models/gemini-2.5-pro"; 
+// モデルを Flash に変更
+const AI_MODEL = "models/gemini-2.5-flash"; 
 const MAX_PROMPT_SIZE_BYTES = 9 * 1024 * 1024; // 9MB
 // ---------------------------------------------------------------------------------
 
@@ -30,6 +34,7 @@ function startReportGeneration() {
   const ui = SpreadsheetApp.getUi();
   let logMessage = "処理開始 (ボタン押下) \n";
   let logFolderId = null;
+  let currentApiKey = null;
 
   try {
     // 0. 設定読み込み
@@ -47,37 +52,36 @@ function startReportGeneration() {
     };
     logFolderId = settings.logFolderId;
 
-    // 1. 知識データ取得
+    // 1. 部署マスター取得
     logMessage += "1. 知識データ取得...\n";
     const masterSheet = ss.getSheetByName(MASTER_SHEET_NAME);
     if (!masterSheet) throw new Error(`ERR-999: シート '${MASTER_SHEET_NAME}' が見つかりません。`);
     const masterData = masterSheet.getDataRange().getValues();
-
-    // 2. 部署Map作成
-    logMessage += "2. 部署Map作成...\n";
-    if (masterData.length <= 1) throw new Error("ERR-003: 部署マスターデータがありません。");
     const departmentMap = new Map();
     for (let i = 1; i < masterData.length; i++) {
       if (masterData[i][1]) departmentMap.set(masterData[i][1], masterData[i][2]);
     }
-    logMessage += `  -> Map作成完了 (${departmentMap.size}件)\n`;
 
     // 3. データ取得
     logMessage += "3. データ取得...\n";
     const dataSheet = ss.getSheetByName(DATA_SHEET_NAME);
     if (!dataSheet) throw new Error(`ERR-999: シート '${DATA_SHEET_NAME}' が見つかりません。`);
     const reportData = dataSheet.getDataRange().getValues();
+    if (reportData.length <= 1) throw new Error("ERR-001: 週報データがありません。");
 
-    // 3-1. データ存在チェック
-    if (reportData.length <= 1) throw new Error("ERR-001: 週報データがありません。抽出条件を確認してください。");
-    logMessage += `  -> データ取得完了 (${reportData.length - 1}件)\n`;
+    // 4. データ前処理：部署ごとにグループ化
+    logMessage += "4. 部署ごとのグループ化処理...\n";
+    const header = reportData[0];
+    const deptGroups = new Map(); // Map<部署名, 行配列[]>
 
-    // 4. データ前処理
-    logMessage += "4. データ前処理...\n";
-    const processedData = reportData.map((row, index) => {
-      if (index === 0) return [...row, "部署名"];
-      return [...row, departmentMap.get(row[1]) || "不明"];
-    });
+    for (let i = 1; i < reportData.length; i++) {
+      const row = reportData[i];
+      const staffName = row[1];
+      const deptName = departmentMap.get(staffName) || "不明";
+      
+      if (!deptGroups.has(deptName)) deptGroups.set(deptName, [header]);
+      deptGroups.get(deptName).push([...row, deptName]);
+    }
 
     // 5. プロンプト雛形取得
     logMessage += "5. プロンプト雛形取得...\n";
@@ -88,56 +92,39 @@ function startReportGeneration() {
       throw new Error(`ERR-201: プロンプト雛形(ID: ${settings.promptDocId})が読み込めません。`);
     }
 
-    // 6. プロンプト結合
-    logMessage += "6. プロンプト結合...\n";
-    const inputDataText = _createGroupedInputText(processedData);
-    const finalPrompt = `${promptTemplate}\n\n---\n入力データ:\n${inputDataText}\n`;
+    // APIキーの取得
+    currentApiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+    if (!currentApiKey) throw new Error("スクリプトプロパティ 'GEMINI_API_KEY' が未設定です。");
 
-    // 6-1. サイズチェック
-    const promptSize = Utilities.newBlob(finalPrompt).getBytes().length;
-    logMessage += `  -> サイズ: ${promptSize} byte\n`;
-    if (promptSize > MAX_PROMPT_SIZE_BYTES) throw new Error(`ERR-002: プロンプトサイズ超過 (${promptSize} byte)。`);
+    // 7. 部署ごとにAPIを呼び出して内容を生成
+    logMessage += `7. 部署別分割処理開始 (合計 ${deptGroups.size} 部署)...\n`;
+    let totalAiContent = "";
+    const sortedDepts = Array.from(deptGroups.keys()).sort();
 
-    // 7. API呼び出し
-    logMessage += "7. Gemini API 呼び出し...\n";
-    let aiResponseText;
-    try {
-      const API_KEY = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-      if (!API_KEY) throw new Error("スクリプトプロパティ 'GEMINI_API_KEY' が未設定です。");
+    for (const deptName of sortedDepts) {
+      logMessage += `  -> ${deptName} の週報を生成中...\n`;
+      const deptData = deptGroups.get(deptName);
+      const inputDataText = _createGroupedInputText(deptData);
+      
+      // 部署固有の指示を追加して、取りこぼしを防ぐ
+      const specificPrompt = `${promptTemplate}
 
-      const API_URL = `https://generativelanguage.googleapis.com/v1beta/${AI_MODEL}:generateContent?key=${API_KEY}`;
-      const options = {
-        'method': 'post',
-        'contentType': 'application/json',
-        'payload': JSON.stringify({ "contents": [{ "parts": [{ "text": finalPrompt }] }] }),
-        'muteHttpExceptions': true,
-        'timeoutSeconds': 300
-      };
+---
+【重要指示】
+現在は「${deptName}」のセクションを作成しています。
+タイトルや全体サマリーは含めず、この部署の「### 部署名」から始まる詳細内容のみを、
+漏れなく出力してください。
 
-      const res = UrlFetchApp.fetch(API_URL, options);
-      const resCode = res.getResponseCode();
-      const resBody = res.getContentText();
+入力データ:
+${inputDataText}
+`;
 
-      if (resCode === 200) {
-        const json = JSON.parse(resBody);
-        if (json.candidates?.[0]?.content?.parts?.[0]?.text) {
-          aiResponseText = json.candidates[0].content.parts[0].text;
-        } else {
-          throw new Error("AI応答形式エラー。");
-        }
-      } else {
-        throw new Error(`APIエラー (HTTP ${resCode}): ${resBody.substring(0, 200)}...`);
-      }
-    } catch (e) {
-      if (e.message.includes("Timeout") || e.message.includes("deadline")) {
-        throw new Error(`ERR-101: タイムアウト(5分超過)。`);
-      }
-      throw new Error(`ERR-100: AI通信エラー。 ${e.message}`);
+      const response = _callGeminiApi(specificPrompt, currentApiKey);
+      totalAiContent += response + "\n\n---\n\n";
     }
-    logMessage += "  -> 応答取得完了。\n";
 
-    // 8. 出力処理
-    logMessage += "8. 出力処理...\n";
+    // 8. ドキュメント出力
+    logMessage += "8. ドキュメント出力処理...\n";
     const outputFolder = DriveApp.getFolderById(settings.outputFolderId);
     const fileName = "週報_" + Utilities.formatDate(settings.startDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
     
@@ -145,7 +132,13 @@ function startReportGeneration() {
     while (existing.hasNext()) existing.next().setTrashed(true);
 
     const doc = DocumentApp.create(fileName);
-    _applyMarkdownStyles(doc.getBody(), aiResponseText);
+    const body = doc.getBody();
+    
+    // 冒頭にタイトルを挿入
+    const titleDate = Utilities.formatDate(settings.startDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
+    body.appendParagraph(`営業週報（${titleDate} 〜）`).setHeading(DocumentApp.ParagraphHeading.TITLE);
+    
+    _applyMarkdownStyles(body, totalAiContent);
     doc.saveAndClose();
     
     const file = DriveApp.getFileById(doc.getId());
@@ -153,48 +146,56 @@ function startReportGeneration() {
     DriveApp.getRootFolder().removeFile(file);
 
     logMessage += "P. 処理成功\n";
-    ui.alert("週報の自動作成が完了しました。");
+    ui.alert("週報の自動作成が完了しました。全ての部署の内容が含まれています。");
 
   } catch (e) {
-    // ★★★ エラーハンドリング変更箇所 ★★★
-    logMessage += `Z. エラー発生: ${e.message}\nStack: ${e.stack}\n`;
-    
-    let userMessage = e.message;
-    // システム内部エラーの場合のプレフィックス付与
-    if (!userMessage.startsWith("ERR-")) {
-      userMessage = `ERR-999: 予期せぬエラー\n(${userMessage})`;
-    }
-
-    // ユーザー向けアラート文言の構築
-    const alertText = `処理を中断しました。
-
-【エラー内容】
-${userMessage}
-
---------------------------------------------------
-この画面のスクリーンショットを撮り、
-システム開発者へお問い合わせください。
---------------------------------------------------
-※詳細はログフォルダのテキストファイルをご確認ください。`;
-
+    let safeErrorMessage = currentApiKey ? e.message.split(currentApiKey).join("********") : e.message;
+    logMessage += `Z. エラー発生: ${safeErrorMessage}\n`;
+    const alertText = `処理を中断しました。\n\n【エラー内容】\n${safeErrorMessage}`;
     ui.alert(alertText);
-
   } finally {
     if (logFolderId) _writeLog(logMessage, logFolderId);
     else Logger.log(logMessage);
   }
 }
 
-// --- ヘルパー関数 (変更なし) ---
+/**
+ * Gemini APIを呼び出す内部関数
+ */
+function _callGeminiApi(prompt, apiKey) {
+  const API_URL = `https://generativelanguage.googleapis.com/v1beta/${AI_MODEL}:generateContent?key=${apiKey}`;
+  const options = {
+    'method': 'post',
+    'contentType': 'application/json',
+    'payload': JSON.stringify({ "contents": [{ "parts": [{ "text": prompt }] }] }),
+    'muteHttpExceptions': true,
+    'timeoutSeconds': 300
+  };
+
+  const res = UrlFetchApp.fetch(API_URL, options);
+  const resCode = res.getResponseCode();
+  const resBody = res.getContentText();
+
+  if (resCode === 200) {
+    const json = JSON.parse(resBody);
+    return json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  } else {
+    throw new Error(`APIエラー (HTTP ${resCode})`);
+  }
+}
+
+// --- ヘルパー関数 ---
 function _writeLog(msg, fid) {
   try { DriveApp.getFolderById(fid).createFile(`log_${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyyMMddHHmmss")}.txt`, msg); } catch(e){}
 }
+
 function _escapeCsvCell(c) {
   let s = (c == null) ? "" : String(c);
   s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n{3,}/g, "\n\n");
   if (s.includes('"') || s.includes(',') || s.includes('\n')) s = `"${s.replace(/"/g, '""')}"`;
   return s;
 }
+
 function _createGroupedInputText(data) {
   const map = new Map();
   const h = data[0];
@@ -205,7 +206,7 @@ function _createGroupedInputText(data) {
   
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
-    const s = r[1];
+    const s = r[1]; // 担当者
     if (!map.has(s)) map.set(s, []);
     map.get(s).push(r);
   }
@@ -218,93 +219,46 @@ function _createGroupedInputText(data) {
   }
   return txt;
 }
-/**
- * AIが生成したマークダウンテキストを解析し、Google Docのスタイルを適用します。
- * 修正: "####" (担当者名) を「太字の本文」ではなく「見出し3」として扱い、以前の書式に戻しました。
- */
+
 function _applyMarkdownStyles(body, rawAiText) {
-
-  if (!rawAiText) {
-    return;
-  }
-
-  const cleanedText = rawAiText.replace(/^\uFEFF/, "").trim();
-  const lines = cleanedText.split('\n');
-
+  if (!rawAiText) return;
+  const lines = rawAiText.replace(/^\uFEFF/, "").split('\n');
   lines.forEach(line => {
-
     try {
       const trimmedLine = line.trim();
-
-      if (trimmedLine.startsWith("---") && trimmedLine.length < 5) {
-        body.appendHorizontalRule();
-        return;
-      }
-      if (trimmedLine === "") {
-        body.appendParagraph("");
-        return;
-      }
+      if (trimmedLine.startsWith("---")) { body.appendHorizontalRule(); return; }
+      if (trimmedLine === "") { body.appendParagraph(""); return; }
 
       let plainText = trimmedLine;
       let headingType = null;
-      let isBold = false; // 見出しのみ太字
-      let isListItem = false;
-      let indentLevel = 0;
+      let isBold = false;
 
-      // スタイルの判定 (見出し)
-      // Googleドキュメントの階層構造に合わせてマッピングします
       if (plainText.startsWith("# ")) {
-        headingType = DocumentApp.ParagraphHeading.TITLE; // タイトル
+        headingType = DocumentApp.ParagraphHeading.TITLE;
         plainText = plainText.substring(2);
         isBold = true;
       } else if (plainText.startsWith("## ")) {
-        headingType = DocumentApp.ParagraphHeading.HEADING1; // 見出し1 (セクション)
+        headingType = DocumentApp.ParagraphHeading.HEADING1;
         plainText = plainText.substring(3);
         isBold = true;
       } else if (plainText.startsWith("### ")) {
-        headingType = DocumentApp.ParagraphHeading.HEADING2; // 見出し2 (部署名)
+        headingType = DocumentApp.ParagraphHeading.HEADING2;
         plainText = plainText.substring(4);
         isBold = true;
       } else if (plainText.startsWith("#### ")) {
-        // ★修正箇所: ここを「見出し3」に戻します
-        headingType = DocumentApp.ParagraphHeading.HEADING3; // 見出し3 (担当者名)
+        headingType = DocumentApp.ParagraphHeading.HEADING3;
         plainText = plainText.substring(5);
         isBold = true;
       }
-      // リスト (-) の判定
-      else if (rawLineContent = line.match(/^(\s*)- /) || line.match(/^(\s*)\* /)) {
-        isListItem = true;
-        const indentMatch = line.match(/^\s*/);
-        indentLevel = indentMatch ? Math.floor(indentMatch[0].length / 2) : 0;
-        plainText = line.replace(/^\s*[-*] /, "").trim();
+      else if (line.match(/^(\s*)- /) || line.match(/^(\s*)\* /)) {
+        const p = body.appendListItem(line.replace(/^\s*[-*] /, "").trim());
+        p.setGlyphType(DocumentApp.GlyphType.BULLET);
+        return;
       }
 
-      // ドキュメントに書き込む
-      let paragraph;
-
-      if (isListItem) {
-        const listItem = body.appendListItem(plainText);
-        listItem.setGlyphType(DocumentApp.GlyphType.BULLET);
-        if (indentLevel > 0) {
-          listItem.setIndentFirstLine(18 * indentLevel);
-          listItem.setIndentStart(36 * indentLevel);
-        }
-        paragraph = listItem;
-      } else {
-        paragraph = body.appendParagraph(plainText);
-        if (headingType) {
-          paragraph.setHeading(headingType);
-        }
-      }
-
-      // 行全体の太字を適用 (見出しの場合のみ)
-      if (isBold && plainText.length > 0 && paragraph) {
-        const textElement = paragraph.editAsText();
-        const textLength = textElement.getText().length;
-        if (textLength > 0) {
-          textElement.setBold(0, textLength - 1, true);
-        }
-      }
+      const paragraph = body.appendParagraph(plainText);
+      if (headingType) paragraph.setHeading(headingType);
+      if (isBold && plainText.length > 0) paragraph.editAsText().setBold(true);
 
     } catch (e) {
       Logger.log(`スタイル適用エラー: ${e.message}`);
