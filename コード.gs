@@ -16,15 +16,14 @@ function onOpen() {
 
 // --- 定数定義 ---
 const SETTINGS_SHEET_NAME = "設定シート";
-const PROMPT_DOC_ID_CELL = "B7";
-const OUTPUT_FOLDER_ID_CELL = "B8";
-const LOG_FOLDER_ID_CELL = "B9";
-const START_DATE_CELL = "B3";
-const END_DATE_CELL = "B4";
+const PROMPT_DOC_ID_CELL = "B6";   // B7からB6へ修正
+const OUTPUT_FOLDER_ID_CELL = "B7"; // B8からB7へ修正
+const LOG_FOLDER_ID_CELL = "B8";   // B9からB8へ修正
+const START_DATE_CELL = "B2";      // B3からB2へ修正
+const END_DATE_CELL = "B3";        // B4からB3へ修正
 const MASTER_SHEET_NAME = "FOCusユーザマスタ";
 const DATA_SHEET_NAME = "週報データ抽出";
-const AI_MODEL = "models/gemini-2.5-flash"; 
-
+const AI_MODEL = "models/gemini-2.5-flash";
 /**
  * 週報自動作成のメイン処理
  */
