@@ -139,8 +139,17 @@ ${detailContent}
     // 構成の統合： [タイトル] -> [全体サマリー] -> [部署別詳細] -> [組織課題]
     body.appendParagraph(`営業週報（${titleDate} 〜）`).setHeading(DocumentApp.ParagraphHeading.TITLE);
     
-    // 分析結果（冒頭サマリーと末尾課題を含む）をパースして適用
-    _applyMarkdownStyles(body, analysisResult + "\n\n" + detailContent);
+    // --- 修正前 ---
+    // _applyMarkdownStyles(body, analysisResult + "\n\n" + detailContent);
+
+    // --- 修正案：分析結果を「サマリー」と「課題」に分離して配置 ---
+    const parts = analysisResult.split(/## 組織全体の課題と次週の重点事項/);
+    const summaryPart = parts[0];
+    const issuesPart = parts.length > 1 ? "## 組織全体の課題と次週の重点事項" + parts[1] : "";
+
+    _applyMarkdownStyles(body, summaryPart); // 1. サマリーを挿入
+    _applyMarkdownStyles(body, detailContent); // 2. 部署別詳細を挿入
+    _applyMarkdownStyles(body, issuesPart);   // 3. 組織課題を最後に挿入
 
     doc.saveAndClose();
     const file = DriveApp.getFileById(doc.getId());
