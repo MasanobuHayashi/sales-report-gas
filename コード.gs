@@ -230,7 +230,6 @@ function _applyMarkdownStyles(body, rawAiText) {
     } else {
       const p = body.appendParagraph(plain);
       if (head) {
-        // 見出しスタイルを適用し、太字にする
         p.setHeading(head).setBold(true);
         lastWasHeading = true;
       } else {
