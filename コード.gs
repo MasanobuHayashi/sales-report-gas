@@ -193,14 +193,28 @@ function _createStaffText(staff, dept, rows) {
 }
 
 /**
- * 修正版：見出しスタイルの適用時に太字を強制する
+ * 最終修正版：書式設定の適正化
+ * 1. 見出し以外の標準テキストは明示的に太字を解除する。
+ * 2. 見出し（部署名）と次の行（担当者名）の間の空行を自動的に詰める。
  */
 function _applyMarkdownStyles(body, rawAiText) {
   if (!rawAiText) return;
+  
   const lines = rawAiText.replace(/^\uFEFF/, "").split('\n');
+  let lastWasHeading = false; // 直前の行が見出しだったかを判定
+
   lines.forEach(line => {
     let plain = line.trim();
-    if (plain === "") { body.appendParagraph(""); return; }
+    
+    // 空行の処理
+    if (plain === "") {
+      // 見出しの直後の空行はスキップ（詰める）
+      if (!lastWasHeading) {
+        body.appendParagraph("");
+      }
+      lastWasHeading = false;
+      return;
+    }
 
     let head = null;
     if (plain.startsWith("# ")) { head = DocumentApp.ParagraphHeading.TITLE; plain = plain.substring(2); }
@@ -209,11 +223,21 @@ function _applyMarkdownStyles(body, rawAiText) {
     else if (plain.startsWith("#### ")) { head = DocumentApp.ParagraphHeading.HEADING3; plain = plain.substring(5); }
 
     if (line.match(/^(\s*)- /) || line.match(/^(\s*)\* /)) {
-      body.appendListItem(plain.replace(/^[-*]\s+/, "")).setGlyphType(DocumentApp.GlyphType.BULLET);
+      const listItem = body.appendListItem(plain.replace(/^[-*]\s+/, ""));
+      listItem.setGlyphType(DocumentApp.GlyphType.BULLET);
+      listItem.setBold(false); // リスト項目は太字にしない
+      lastWasHeading = false;
     } else {
       const p = body.appendParagraph(plain);
-      // 【修正】スタイル適用と同時に太字(Bold)を設定する
-      if (head) p.setHeading(head).setBold(true);
+      if (head) {
+        // 見出しスタイルを適用し、太字にする
+        p.setHeading(head).setBold(true);
+        lastWasHeading = true;
+      } else {
+        // 標準テキストは明示的に太字を解除する
+        p.setBold(false);
+        lastWasHeading = false;
+      }
     }
   });
 }
