@@ -220,7 +220,12 @@ function _applyMarkdownStyles(body, rawAiText) {
     if (plain.startsWith("# ")) { head = DocumentApp.ParagraphHeading.TITLE; plain = plain.substring(2); }
     else if (plain.startsWith("## ")) { head = DocumentApp.ParagraphHeading.HEADING1; plain = plain.substring(3); }
     else if (plain.startsWith("### ")) { head = DocumentApp.ParagraphHeading.HEADING2; plain = plain.substring(4); }
-    else if (plain.startsWith("#### ")) { head = DocumentApp.ParagraphHeading.HEADING3; plain = plain.substring(5); }
+    else if (plain.startsWith("#### ")) { 
+      // 【修正箇所】HEADING3からNORMAL（標準テキスト）に変更
+      head = DocumentApp.ParagraphHeading.NORMAL; 
+      plain = plain.substring(5); 
+      isStaffName = true; 
+    }
 
     if (line.match(/^(\s*)- /) || line.match(/^(\s*)\* /)) {
       const listItem = body.appendListItem(plain.replace(/^[-*]\s+/, ""));
