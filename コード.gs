@@ -193,54 +193,66 @@ function _createStaffText(staff, dept, rows) {
 }
 
 /**
- * 最終修正版：書式設定の適正化
- * 1. 見出し以外の標準テキストは明示的に太字を解除する。
- * 2. 見出し（部署名）と次の行（担当者名）の間の空行を自動的に詰める。
+ * 書式設定の適正化（最終版）
+ * 1. セクション間を含む、全ての不要な空行を排除。
+ * 2. タイトル（#）を16pt、営業部・セクション見出し（##, ###）を14ptに設定。
+ * 3. 担当者名（####）は標準サイズ（10.5pt）の太字を維持。
  */
 function _applyMarkdownStyles(body, rawAiText) {
   if (!rawAiText) return;
   
   const lines = rawAiText.replace(/^\uFEFF/, "").split('\n');
-  let lastWasHeading = false; // 直前の行が見出しだったかを判定
 
   lines.forEach(line => {
     let plain = line.trim();
     
-    // 空行の処理
+    // 【修正】全ての空行を無視（セクション間などの余白を一切作成しない）
     if (plain === "") {
-      // 見出しの直後の空行はスキップ（詰める）
-      if (!lastWasHeading) {
-        body.appendParagraph("");
-      }
-      lastWasHeading = false;
       return;
     }
 
     let head = null;
-    if (plain.startsWith("# ")) { head = DocumentApp.ParagraphHeading.TITLE; plain = plain.substring(2); }
-    else if (plain.startsWith("## ")) { head = DocumentApp.ParagraphHeading.HEADING1; plain = plain.substring(3); }
-    else if (plain.startsWith("### ")) { head = DocumentApp.ParagraphHeading.HEADING2; plain = plain.substring(4); }
+    let fontSize = null;
+
+    // マッピングとフォントサイズの指定
+    if (plain.startsWith("# ")) { 
+      head = DocumentApp.ParagraphHeading.TITLE; 
+      plain = plain.substring(2); 
+      fontSize = 16; // 【追加】タイトルは16pt
+    }
+    else if (plain.startsWith("## ")) { 
+      head = DocumentApp.ParagraphHeading.HEADING1; 
+      plain = plain.substring(3); 
+      fontSize = 14; // 【追加】セクション見出しは14pt
+    }
+    else if (plain.startsWith("### ")) { 
+      head = DocumentApp.ParagraphHeading.HEADING2; 
+      plain = plain.substring(4); 
+      fontSize = 14; // 【追加】営業部名は14pt
+    }
     else if (plain.startsWith("#### ")) { 
-      // 【修正箇所】HEADING3からNORMAL（標準テキスト）に変更
       head = DocumentApp.ParagraphHeading.NORMAL; 
-      plain = plain.substring(5); 
-      isStaffName = true; 
+      plain = plain.substring(5);
+      fontSize = 10.5; // 標準サイズ
     }
 
+    // リスト項目の処理
     if (line.match(/^(\s*)- /) || line.match(/^(\s*)\* /)) {
       const listItem = body.appendListItem(plain.replace(/^[-*]\s+/, ""));
       listItem.setGlyphType(DocumentApp.GlyphType.BULLET);
-      listItem.setBold(false); // リスト項目は太字にしない
-      lastWasHeading = false;
-    } else {
+      listItem.setBold(false); 
+      listItem.setFontSize(10.5);
+    } 
+    // 段落（見出し含む）の処理
+    else {
       const p = body.appendParagraph(plain);
-      if (head) {
-        p.setHeading(head).setBold(true);
-        lastWasHeading = true;
+      if (head !== null) {
+        p.setHeading(head);
+        p.setBold(true); 
+        if (fontSize) p.setFontSize(fontSize); // 指定サイズを適用
       } else {
-        // 標準テキストは明示的に太字を解除する
         p.setBold(false);
-        lastWasHeading = false;
+        p.setFontSize(10.5); // 標準サイズ
       }
     }
   });
